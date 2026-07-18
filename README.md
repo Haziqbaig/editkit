@@ -16,12 +16,21 @@ No servers, no uploads, no watermarks — your files never leave your device, an
 
 ### 📄 PDF Editor
 - Page thumbnails with click-to-select
+- **Drag & drop page reordering**
 - Rotate pages
 - Delete pages
 - Extract page ranges (e.g. `1-3,5`)
+- **Split** a PDF into two files at any page
 - Merge multiple PDFs
+- **Images → PDF** (convert PNG/JPEG images into a PDF)
+- **Pages → PNG** (export PDF pages as high-res images)
+- **Diagonal watermark** with adjustable opacity
+- **Page numbering** (`1 / N` footer)
+- **Metadata editing** (title, author, subject)
 - Stamp text on pages (position + opacity)
 - Download clean, standard PDFs
+
+*Feature set inspired by [Stirling-PDF](https://github.com/Stirling-Tools/stirling-pdf) — rebuilt here as a fully client-side app with zero backend.*
 
 ## 🚀 Run locally
 

@@ -160,7 +160,7 @@
 
       <div class="panel" style="margin-top:16px">
         <h3>Page tools</h3>
-        <p class="hint">Click page thumbnails to select them, then:</p>
+        <p class="hint">Click thumbnails to select · drag thumbnails to reorder pages.</p>
         <button class="btn" id="pdfRotSel">⟳ Rotate selected 90°</button>
         <button class="btn danger" id="pdfDelSel">🗑 Delete selected</button>
         <label style="margin-top:10px">Extract page range</label>
@@ -174,6 +174,36 @@
         <h3>Merge</h3>
         <p class="hint">Load multiple PDFs above — they merge in list order.</p>
         <button class="btn wide" id="pdfMerge">🔗 Merge all loaded PDFs</button>
+      </div>
+
+      <div class="panel" style="margin-top:16px">
+        <h3>Split &amp; convert</h3>
+        <label>Split after page</label>
+        <div class="row">
+          <input type="number" id="pdfSplitAt" placeholder="e.g. 3" min="1">
+          <button class="btn" id="pdfSplit">✂️ Split</button>
+        </div>
+        <button class="btn wide" style="margin-top:10px" id="imgToPdfBtn">🖼️ Images → PDF</button>
+        <input type="file" id="imgToPdfFile" accept="image/png,image/jpeg" multiple hidden>
+        <button class="btn wide" style="margin-top:6px" id="pdfToImg">📷 Pages → PNG images</button>
+        <p class="hint">Pages → PNG exports selected pages (or all) at 2× resolution.</p>
+      </div>
+
+      <div class="panel" style="margin-top:16px">
+        <h3>Watermark &amp; numbering</h3>
+        <input type="text" id="wmText" placeholder="Watermark text…">
+        <label style="margin-top:8px">Opacity <span class="val" id="v-wmop">25%</span></label>
+        <input type="range" id="wmOp" min="5" max="100" value="25">
+        <button class="btn wide" style="margin-top:8px" id="wmApply">💧 Apply diagonal watermark</button>
+        <button class="btn wide" style="margin-top:6px" id="pageNumsBtn">#️⃣ Add page numbers</button>
+      </div>
+
+      <div class="panel" style="margin-top:16px">
+        <h3>Metadata</h3>
+        <input type="text" id="metaTitle" placeholder="Title">
+        <input type="text" id="metaAuthor" placeholder="Author" style="margin-top:6px">
+        <input type="text" id="metaSubject" placeholder="Subject" style="margin-top:6px">
+        <button class="btn wide" style="margin-top:8px" id="metaApply">💾 Save metadata</button>
       </div>
 
       <div class="panel" style="margin-top:16px">
@@ -397,8 +427,30 @@ async function refreshThumbs() {
       if (selectedPages.has(i-1)) selectedPages.delete(i-1); else selectedPages.add(i-1);
       div.classList.toggle('selected');
     };
+    /* drag & drop reorder */
+    div.draggable = true;
+    div.ondragstart = e => { e.dataTransfer.setData('text/plain', String(i - 1)); e.dataTransfer.effectAllowed = 'move'; };
+    div.ondragover = e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
+    div.ondrop = async e => {
+      e.preventDefault();
+      const from = parseInt(e.dataTransfer.getData('text/plain'));
+      const to = i - 1;
+      if (isNaN(from) || from === to) return;
+      await reorderPage(from, to);
+    };
     wrap.appendChild(div);
   }
+}
+async function reorderPage(from, to) {
+  const src = await PDFDocument.load(workDoc);
+  const order = src.getPageIndices();
+  order.splice(to, 0, order.splice(from, 1)[0]);
+  const out = await PDFDocument.create();
+  (await out.copyPages(src, order)).forEach(p => out.addPage(p));
+  workDoc = await out.save();
+  selectedPages.clear();
+  await refreshThumbs();
+  toast(`Moved page ${from + 1} → position ${to + 1}`);
 }
 async function withDoc(fn) {
   if (!workDoc) { toast('Load a PDF first'); return; }
@@ -468,6 +520,96 @@ function downloadPdf(bytes, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 $('#pdfDownload').onclick = () => { if (!workDoc) return toast('Nothing to download'); downloadPdf(workDoc, 'edited.pdf'); toast('Downloaded ✓'); };
+
+/* ---- Stirling-inspired tools ---- */
+$('#pdfSplit').onclick = async () => {
+  if (!workDoc) return toast('Load a PDF first');
+  const at = parseInt($('#pdfSplitAt').value);
+  const src = await PDFDocument.load(workDoc);
+  const n = src.getPageCount();
+  if (isNaN(at) || at < 1 || at >= n) return toast(`Enter a page between 1 and ${n - 1}`);
+  const partA = await PDFDocument.create();
+  (await partA.copyPages(src, [...Array(at).keys()])).forEach(p => partA.addPage(p));
+  const partB = await PDFDocument.create();
+  (await partB.copyPages(src, [...Array(n - at).keys()].map(i => i + at))).forEach(p => partB.addPage(p));
+  downloadPdf(await partA.save(), `part1-pages-1-${at}.pdf`);
+  setTimeout(async () => downloadPdf(await partB.save(), `part2-pages-${at + 1}-${n}.pdf`), 400);
+  toast('Split into 2 PDFs ✓');
+};
+
+$('#imgToPdfBtn').onclick = () => $('#imgToPdfFile').click();
+$('#imgToPdfFile').onchange = async e => {
+  const files = [...e.target.files].filter(f => /image\/(png|jpeg)/.test(f.type));
+  if (!files.length) return toast('Pick PNG or JPEG images');
+  const out = await PDFDocument.create();
+  for (const f of files) {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    const img = f.type === 'image/png' ? await out.embedPng(bytes) : await out.embedJpg(bytes);
+    const page = out.addPage([img.width, img.height]);
+    page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+  }
+  const bytes = await out.save();
+  if (!workDoc) { workDoc = bytes; await refreshThumbs(); toast('PDF created from images — now the working doc'); }
+  else { downloadPdf(bytes, 'images.pdf'); toast('images.pdf downloaded ✓'); }
+  e.target.value = '';
+};
+
+$('#pdfToImg').onclick = async () => {
+  if (!workDoc) return toast('Load a PDF first');
+  const doc = await pdfjsLib.getDocument({ data: workDoc.slice() }).promise;
+  const targets = selectedPages.size ? [...selectedPages].sort((a, b) => a - b) : [...Array(doc.numPages).keys()];
+  toast(`Exporting ${targets.length} page(s) as PNG…`);
+  for (const idx of targets) {
+    const page = await doc.getPage(idx + 1);
+    const vp = page.getViewport({ scale: 2 });
+    const c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height;
+    await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+    const a = document.createElement('a');
+    a.download = `page-${idx + 1}.png`; a.href = c.toDataURL('image/png'); a.click();
+    await new Promise(r => setTimeout(r, 350));
+  }
+  toast('Pages exported ✓');
+};
+
+$('#wmOp').oninput = () => $('#v-wmop').textContent = $('#wmOp').value + '%';
+$('#wmApply').onclick = () => withDoc(async doc => {
+  const text = $('#wmText').value.trim(); if (!text) return toast('Enter watermark text');
+  const op = parseInt($('#wmOp').value) / 100;
+  const font = await doc.embedFont(StandardFonts.HelveticaBold);
+  doc.getPages().forEach(p => {
+    const { width, height } = p.getSize();
+    const size = Math.min(width, height) / (text.length * 0.45);
+    const tw = font.widthOfTextAtSize(text, size);
+    p.drawText(text, {
+      x: width / 2 - (tw / 2) * Math.cos(Math.PI / 4),
+      y: height / 2 - (tw / 2) * Math.sin(Math.PI / 4),
+      size, font, color: rgb(0.5, 0.5, 0.5), opacity: op,
+      rotate: degrees(45),
+    });
+  });
+  toast('Watermark applied');
+});
+
+$('#pageNumsBtn').onclick = () => withDoc(async doc => {
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const pages = doc.getPages(); const n = pages.length;
+  pages.forEach((p, i) => {
+    const { width } = p.getSize();
+    const label = `${i + 1} / ${n}`;
+    const tw = font.widthOfTextAtSize(label, 11);
+    p.drawText(label, { x: (width - tw) / 2, y: 14, size: 11, font, color: rgb(0.35, 0.35, 0.35) });
+  });
+  toast('Page numbers added');
+});
+
+$('#metaApply').onclick = () => withDoc(async doc => {
+  const t = $('#metaTitle').value, a = $('#metaAuthor').value, s = $('#metaSubject').value;
+  if (!t && !a && !s) return toast('Fill at least one field');
+  if (t) doc.setTitle(t);
+  if (a) doc.setAuthor(a);
+  if (s) doc.setSubject(s);
+  toast('Metadata saved');
+});
 </script>
 </body>
 </html>
