@@ -290,10 +290,9 @@
       <!-- ===== NEW: EDIT EXISTING TEXT ===== -->
       <div class="panel" style="margin-top:16px">
         <h3>✏️ Edit Existing Text <span class="edit-badge" id="editCount">0 edits</span></h3>
-        <p class="hint">Click on any text in the PDF preview to edit it directly. Changes are tracked and can be applied to the document.</p>
+        <p class="hint">Click any text in the preview, type the new value, press <b>Enter</b> — the change is written into the PDF instantly, keeping the original font, size and color. Save with empty text to delete it. <b>Ctrl+Z</b> undoes.</p>
         <div class="text-edit-list" id="textEditList"></div>
-        <button class="btn wide primary" style="margin-top:10px" id="applyTextEdits">💾 Apply All Text Edits</button>
-        <button class="btn wide danger" style="margin-top:6px" id="clearTextEdits">Clear All Edits</button>
+        <button class="btn wide" style="margin-top:10px" id="undoTextEdit">↩ Undo last edit</button>
       </div>
 
       <div class="panel" style="margin-top:16px">
@@ -523,10 +522,10 @@ let pdfFiles = []; // {name, bytes}
 let workDoc = null; // current pdf-lib doc bytes
 let selectedPages = new Set();
 
-// ===== NEW: TEXT EDITING STATE =====
-let textEdits = []; // { pageIndex, oldText, newText, textItemIndex, x, y, fontSize, fontName, width, height }
+// ===== TEXT EDITING STATE (WYSIWYG: edits are written into the PDF immediately) =====
+let editHistory = []; // { pageIndex, oldText, newText, snapshot } — snapshot = workDoc bytes before the edit
 let currentPdfDoc = null; // pdfjs document for text extraction
-let currentPdfPages = []; // rendered page data
+let currentPdfPages = []; // { page, viewport, canvas } per rendered page
 
 setupDrop($('#pdfDrop'), $('#pdfFile'), async files => {
   for (const f of files) {
@@ -548,116 +547,120 @@ function renderFileList() {
     pdfFiles.splice(+x.dataset.i, 1); renderFileList();
     workDoc = pdfFiles.length ? pdfFiles[0].bytes.slice() : null;
     selectedPages.clear(); 
-    textEdits = []; // Clear edits when changing PDF
+    editHistory = []; // Clear edit history when changing PDF
     updateEditList();
     await refreshThumbs();
     await renderPdfForEditing();
   });
 }
 
-// ===== NEW: RENDER PDF FOR TEXT EDITING =====
+// ===== RENDER PDF FOR TEXT EDITING (WYSIWYG) =====
+// Edits are written straight into the PDF at exact PDF-space coordinates,
+// preserving the original font family/weight/style, size and color, then the
+// page is re-rendered from the real document — what you see is what you get.
 async function renderPdfForEditing() {
   const container = $('#pdfViewerContainer');
   if (!workDoc) {
     container.innerHTML = '<p class="hint">Load a PDF to enable text editing…</p>';
     return;
   }
-  
+
   container.innerHTML = '';
   currentPdfPages = [];
-  
+
   try {
     currentPdfDoc = await pdfjsLib.getDocument({ data: workDoc.slice() }).promise;
-    
+
     for (let pageNum = 1; pageNum <= currentPdfDoc.numPages; pageNum++) {
       const page = await currentPdfDoc.getPage(pageNum);
       const viewport = page.getViewport({ scale: 1.5 });
-      
-      // Create page container
+
       const pageContainer = document.createElement('div');
       pageContainer.className = 'pdf-page-container';
       pageContainer.style.width = viewport.width + 'px';
       pageContainer.style.height = viewport.height + 'px';
-      
-      // Create canvas for rendering
+
       const canvas = document.createElement('canvas');
       canvas.className = 'pdf-page-canvas';
       canvas.width = viewport.width;
       canvas.height = viewport.height;
-      
-      const canvasContext = canvas.getContext('2d');
+      const canvasContext = canvas.getContext('2d', { willReadFrequently: true });
       await page.render({ canvasContext, viewport }).promise;
-      
-      // Create text layer for editing
+
+      // --- editable text layer ---
       const textLayer = document.createElement('div');
       textLayer.className = 'text-layer';
-      
-      // Get text content
+
       const textContent = await page.getTextContent();
-      
-      // Remove duplicate text items (PDF.js sometimes returns duplicates)
-      const uniqueItems = [];
+      const rawItems = textContent.items;
+      const styleArr = await extractTextStyles(page, rawItems.length);
+
+      // De-duplicate (pdf.js sometimes returns the same text twice),
+      // keeping the raw index so colors/fonts stay aligned.
       const seen = new Set();
-      textContent.items.forEach((item, idx) => {
-        const key = `${item.str}|${Math.round(item.transform[4])}|${Math.round(item.transform[5])}`;
-        if (!seen.has(key) && item.str.trim()) {
-          seen.add(key);
-          uniqueItems.push({ item, idx });
-        }
+      const unique = [];
+      rawItems.forEach((item, rawIdx) => {
+        if (!item.str || !item.str.trim()) return;
+        const key = item.str + '|' + Math.round(item.transform[4]) + '|' + Math.round(item.transform[5]);
+        if (seen.has(key)) return;
+        seen.add(key);
+        unique.push({ item, rawIdx });
       });
-      
-      uniqueItems.forEach(({ item, itemIndex }) => {
+
+      unique.forEach(({ item, rawIdx }) => {
+        const st = styleArr[rawIdx] || {};
+        // PDF-space metrics (points) — exactly what pdf-lib needs.
+        const fontSize = Math.hypot(item.transform[2], item.transform[3]) ||
+                         Math.hypot(item.transform[0], item.transform[1]);
+        // Viewport-space metrics (device px) for the overlay + bg sampling.
         const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-        const fontHeight = Math.hypot(tx[0], tx[1]);
-        const fontWidth = Math.hypot(tx[2], tx[3]);
-        
-        // Create text item container
+        const devFontH = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]);
+        const devX = tx[4];
+        const devY = tx[5] - devFontH;                       // top of text
+        const devW = (item.width || 0) * viewport.scale || devFontH * item.str.length * 0.55;
+        const devH = devFontH * 1.2;
+
+        const meta = {
+          originalText: item.str,
+          x: item.transform[4],                              // baseline origin, PDF pts
+          baselineY: item.transform[5],
+          fontSize,
+          width: item.width || 0,
+          color: st.color || [0, 0, 0],
+          realFontName: getRealFontName(page, item.fontName),
+          fontFamily: (textContent.styles[item.fontName] || {}).fontFamily || '',
+          devX, devY, devW, devH,
+        };
+
         const textItem = document.createElement('div');
         textItem.className = 'text-item';
-        textItem.style.left = tx[4] + 'px';
-        textItem.style.top = (tx[5] - fontHeight * 0.8) + 'px';
-        textItem.style.fontSize = fontHeight + 'px';
-        textItem.style.fontFamily = item.fontName || 'sans-serif';
-        textItem.style.minWidth = (fontWidth || fontHeight * item.str.length * 0.5) + 'px';
-        textItem.style.height = (fontHeight * 1.2) + 'px';
-        textItem.dataset.pageIndex = pageNum - 1;
-        textItem.dataset.itemIndex = itemIndex;
-        textItem.dataset.originalText = item.str;
-        textItem.dataset.x = tx[4];
-        textItem.dataset.y = tx[5];
-        textItem.dataset.fontSize = fontHeight;
-        textItem.dataset.fontName = item.fontName || 'Helvetica';
-        
-        // Create display span
+        textItem.style.left = devX + 'px';
+        textItem.style.top = devY + 'px';
+        textItem.style.fontSize = devFontH + 'px';
+        textItem.style.minWidth = devW + 'px';
+        textItem.style.height = devH + 'px';
+        textItem.title = 'Click to edit';
+        textItem._meta = meta;
+
         const displaySpan = document.createElement('span');
         displaySpan.className = 'text-display';
         displaySpan.textContent = item.str;
         textItem.appendChild(displaySpan);
-        
-        // Check if this text has been edited
-        const existingEdit = textEdits.find(e => 
-          e.pageIndex === pageNum - 1 && e.textItemIndex === itemIndex
-        );
-        if (existingEdit) {
-          displaySpan.textContent = existingEdit.newText;
-          textItem.classList.add('edited');
-        }
-        
-        // Click to edit inline
-        textItem.onclick = (e) => {
+
+        textItem.onclick = e => {
           e.stopPropagation();
           e.preventDefault();
-          startInlineEdit(textItem, pageNum - 1, itemIndex);
+          startInlineEdit(textItem, pageNum - 1);
         };
-        
+
         textLayer.appendChild(textItem);
       });
-      
+
       pageContainer.appendChild(canvas);
       pageContainer.appendChild(textLayer);
       container.appendChild(pageContainer);
-      
-      currentPdfPages.push({ page, viewport, textContent: { items: uniqueItems.map(u => u.item) } });
+
+      currentPdfPages.push({ page, viewport, canvas });
     }
   } catch (err) {
     console.error('Error rendering PDF for editing:', err);
@@ -665,273 +668,262 @@ async function renderPdfForEditing() {
   }
 }
 
-// ===== NEW: INLINE TEXT EDITOR =====
-function startInlineEdit(textItem, pageIndex, itemIndex) {
-  // Close any existing inline editor
-  const existingEditor = document.querySelector('.text-item.editing');
-  if (existingEditor) {
-    cancelInlineEdit(existingEditor);
-  }
-  
+// Walk the page's operator list tracking fill color + current font, and map
+// those states onto text items (text items are produced from text-showing
+// ops in the same order). Falls back to black/unknown when alignment fails.
+async function extractTextStyles(page, count) {
+  const out = new Array(count).fill(null);
+  try {
+    const opList = await page.getOperatorList();
+    const OPS = pdfjsLib.OPS;
+    let fill = [0, 0, 0];
+    let fontRef = null;
+    let n = 0;
+    for (let i = 0; i < opList.fnArray.length && n < count; i++) {
+      const fn = opList.fnArray[i];
+      const a = opList.argsArray[i];
+      if (fn === OPS.setFillRGBColor) fill = [a[0], a[1], a[2]];
+      else if (fn === OPS.setFillGray) fill = [a[0], a[0], a[0]];
+      else if (fn === OPS.setFillCMYKColor) {
+        const c = Math.min(1, a[0]), m = Math.min(1, a[1]), y = Math.min(1, a[2]), k = Math.min(1, a[3]);
+        fill = [(1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k)];
+      }
+      else if (fn === OPS.setFont) fontRef = a[0];
+      else if (fn === OPS.showText || fn === OPS.showSpacedText ||
+               fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText) {
+        out[n++] = { color: fill.slice(), fontRef };
+      }
+    }
+  } catch (e) { /* defaults are fine */ }
+  return out;
+}
+
+function getRealFontName(page, fontRef) {
+  try {
+    const obj = page.commonObjs.get(fontRef);
+    return (obj && obj.name) || '';
+  } catch (e) { return ''; }
+}
+
+// Map the original font onto the closest built-in PDF standard font so the
+// replacement text keeps the same look (serif/sans/mono + weight + style).
+function matchStandardFont(realName, family) {
+  const n = ((realName || '') + ' ' + (family || '')).toLowerCase();
+  const bold = /bold|black|heavy|semibold|demi|medium/.test(n);
+  const ital = /italic|oblique/.test(n);
+  let set = ['Helvetica', 'HelveticaOblique', 'HelveticaBold', 'HelveticaBoldOblique'];
+  if (/courier|mono|consol|menlo/.test(n)) set = ['Courier', 'CourierOblique', 'CourierBold', 'CourierBoldOblique'];
+  else if (/times|serif|georgia|roman|book|garamond|palatino|cambria/.test(n)) set = ['TimesRoman', 'TimesItalic', 'TimesBold', 'TimesBoldItalic'];
+  return StandardFonts[bold ? (ital ? set[3] : set[2]) : (ital ? set[1] : set[0])];
+}
+
+// Average the pixels just outside the text box on the rendered page — this is
+// the background we paint over the old text, so it works on colored cells too.
+function sampleBackground(canvas, bx, by, bw, bh) {
+  try {
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const m = 3;
+    const pts = [];
+    for (let i = 0; i <= 4; i++) {
+      const fx = bx + (bw * i) / 4;
+      pts.push([fx, by - m], [fx, by + bh + m]);
+    }
+    pts.push([bx - m, by + bh / 2], [bx + bw + m, by + bh / 2]);
+    let r = 0, g = 0, b = 0, n = 0;
+    for (const [px, py] of pts) {
+      const cx = Math.max(0, Math.min(canvas.width - 1, Math.round(px)));
+      const cy = Math.max(0, Math.min(canvas.height - 1, Math.round(py)));
+      const d = ctx.getImageData(cx, cy, 1, 1).data;
+      if (d[3] === 0) continue;
+      r += d[0]; g += d[1]; b += d[2]; n++;
+    }
+    if (!n) return [1, 1, 1];
+    return [r / n / 255, g / n / 255, b / n / 255];
+  } catch (e) { return [1, 1, 1]; }
+}
+
+// ===== INLINE TEXT EDITOR =====
+function startInlineEdit(textItem, pageIndex) {
+  const existing = document.querySelector('.text-item.editing');
+  if (existing && existing !== textItem) cancelInlineEdit(existing);
+  if (textItem.classList.contains('editing')) return;
+
+  const meta = textItem._meta;
   textItem.classList.add('editing');
-  
+
   const displaySpan = textItem.querySelector('.text-display');
-  const originalText = textItem.dataset.originalText;
-  const currentText = displaySpan.textContent;
-  
-  // Create input
+  displaySpan.style.display = 'none';
+
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'text-input';
-  input.value = currentText;
+  input.value = meta.originalText;
   input.style.fontSize = textItem.style.fontSize;
-  input.style.fontFamily = textItem.style.fontFamily;
-  
-  // Create action buttons
+
+  const fitInput = () => {
+    const devFontH = parseFloat(textItem.style.fontSize) || 12;
+    input.style.width = Math.max(meta.devW + 26, input.value.length * devFontH * 0.62 + 26, 80) + 'px';
+  };
+  fitInput();
+  input.addEventListener('input', fitInput);
+
   const actions = document.createElement('div');
   actions.className = 'text-actions';
-  actions.innerHTML = `
-    <button class="action-btn save-btn">✓ Save</button>
-    <button class="action-btn cancel-btn">✕ Cancel</button>
-  `;
-  
-  // Hide display, show input
-  displaySpan.style.display = 'none';
+  actions.innerHTML = '<button class="action-btn save-btn">✓ Save</button><button class="action-btn cancel-btn">✕ Cancel</button>';
+
   textItem.appendChild(input);
   textItem.appendChild(actions);
-  
-  // Focus and select all
   input.focus();
   input.select();
-  
-  // Handle save
-  const saveBtn = actions.querySelector('.save-btn');
-  const cancelBtn = actions.querySelector('.cancel-btn');
-  
-  const saveEdit = () => {
+
+  let done = false;
+  const saveEdit = async () => {
+    if (done) return;
+    done = true;
     const newText = input.value;
-    
-    if (newText !== originalText) {
-      // Update or add edit
-      const existingIndex = textEdits.findIndex(e => 
-        e.pageIndex === pageIndex && e.textItemIndex === itemIndex
-      );
-      
-      const editData = {
-        pageIndex,
-        textItemIndex: itemIndex,
-        oldText: originalText,
-        newText: newText,
-        x: parseFloat(textItem.dataset.x),
-        y: parseFloat(textItem.dataset.y),
-        fontSize: parseFloat(textItem.dataset.fontSize),
-        fontName: textItem.dataset.fontName,
-        width: textItem.offsetWidth,
-        height: textItem.offsetHeight
-      };
-      
-      if (existingIndex >= 0) {
-        textEdits[existingIndex] = editData;
-      } else {
-        textEdits.push(editData);
-      }
-      
-      displaySpan.textContent = newText;
-      textItem.classList.add('edited');
-      
-      updateEditList();
-      toast('Text edit saved ✓');
-    }
-    
     cancelInlineEdit(textItem);
-  };
-  
-  const cancelEdit = () => {
-    cancelInlineEdit(textItem);
-  };
-  
-  saveBtn.onclick = (e) => {
-    e.stopPropagation();
-    saveEdit();
-  };
-  
-  cancelBtn.onclick = (e) => {
-    e.stopPropagation();
-    cancelEdit();
-  };
-  
-  // Handle keyboard
-  input.onkeydown = (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      saveEdit();
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      cancelEdit();
+    if (newText === meta.originalText) return;
+    try {
+      await commitTextEdit(pageIndex, meta, newText);
+      toast('Text updated ✓  (Ctrl+Z to undo)');
+    } catch (err) {
+      console.error(err);
+      toast('Could not apply edit: ' + err.message);
     }
   };
-  
-  // Close on outside click
+  const cancelEdit = () => { if (!done) { done = true; cancelInlineEdit(textItem); } };
+
+  actions.querySelector('.save-btn').onclick = e => { e.stopPropagation(); saveEdit(); };
+  actions.querySelector('.cancel-btn').onclick = e => { e.stopPropagation(); cancelEdit(); };
+  input.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveEdit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+  };
+  input.onclick = e => e.stopPropagation();
+
   setTimeout(() => {
-    const outsideClickHandler = (e) => {
+    const outside = e => {
       if (!textItem.contains(e.target)) {
+        document.removeEventListener('click', outside);
         saveEdit();
-        document.removeEventListener('click', outsideClickHandler);
       }
     };
-    document.addEventListener('click', outsideClickHandler);
-    
-    // Store handler for cleanup
-    textItem._outsideClickHandler = outsideClickHandler;
-  }, 100);
+    document.addEventListener('click', outside);
+    textItem._outsideClickHandler = outside;
+  }, 120);
 }
 
 function cancelInlineEdit(textItem) {
   textItem.classList.remove('editing');
-  
   const input = textItem.querySelector('.text-input');
   const actions = textItem.querySelector('.text-actions');
   const displaySpan = textItem.querySelector('.text-display');
-  
   if (input) input.remove();
   if (actions) actions.remove();
   if (displaySpan) displaySpan.style.display = 'inline';
-  
-  // Remove outside click handler
   if (textItem._outsideClickHandler) {
     document.removeEventListener('click', textItem._outsideClickHandler);
     delete textItem._outsideClickHandler;
   }
 }
 
-// ===== NEW: UPDATE EDIT LIST =====
+// ===== COMMIT AN EDIT INTO THE PDF =====
+async function commitTextEdit(pageIndex, meta, newText) {
+  const pageInfo = currentPdfPages[pageIndex];
+  const bg = pageInfo
+    ? sampleBackground(pageInfo.canvas, meta.devX, meta.devY, meta.devW, meta.devH)
+    : [1, 1, 1];
+
+  const snapshot = workDoc.slice(); // for undo
+  const doc = await PDFDocument.load(workDoc);
+  const page = doc.getPages()[pageIndex];
+  const font = await doc.embedFont(matchStandardFont(meta.realFontName, meta.fontFamily));
+
+  const size = meta.fontSize;
+  const oldW = meta.width > 0 ? meta.width : font.widthOfTextAtSize(meta.originalText, size);
+  const newW = newText ? font.widthOfTextAtSize(newText, size) : 0;
+  const coverW = Math.max(oldW, newW) + 3;
+
+  // 1) paint over the old text with the sampled background color
+  page.drawRectangle({
+    x: meta.x - 1.5,
+    y: meta.baselineY - size * 0.32,
+    width: coverW,
+    height: size * 1.3,
+    color: rgb(bg[0], bg[1], bg[2]),
+    borderWidth: 0,
+  });
+
+  // 2) draw the replacement text at the exact baseline, original color & look
+  if (newText) {
+    const drawAt = t => page.drawText(t, {
+      x: meta.x,
+      y: meta.baselineY,
+      size,
+      font,
+      color: rgb(meta.color[0], meta.color[1], meta.color[2]),
+    });
+    try {
+      drawAt(newText);
+    } catch (e) {
+      // Standard fonts are WinAnsi — strip unsupported glyphs and retry once
+      const safe = newText.replace(/[^\x20-\x7E\xA0-\xFF]/g, '');
+      if (!safe) throw e;
+      drawAt(safe);
+      toast('Some characters are not supported by standard fonts and were removed');
+    }
+  }
+
+  workDoc = await doc.save();
+  editHistory.push({ pageIndex, oldText: meta.originalText, newText, snapshot });
+  updateEditList();
+  await refreshThumbs();
+  await renderPdfForEditing();
+}
+
+// ===== EDIT HISTORY / UNDO =====
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function updateEditList() {
   const list = $('#textEditList');
-  $('#editCount').textContent = textEdits.length + ' edits';
-  
-  if (textEdits.length === 0) {
-    list.innerHTML = '<p class="hint">No text edits yet. Click on any text in the PDF preview to edit.</p>';
+  $('#editCount').textContent = editHistory.length + ' edits';
+  if (!editHistory.length) {
+    list.innerHTML = '<p class="hint">No edits yet — click any text in the preview to change it.</p>';
     return;
   }
-  
-  list.innerHTML = textEdits.map((edit, index) => `
+  list.innerHTML = editHistory.map((e, i) => `
     <div class="text-edit-item">
-      <span class="page-num">P${edit.pageIndex + 1}</span>
-      <span class="old-text">${edit.oldText}</span>
+      <span class="page-num">P${e.pageIndex + 1}</span>
+      <span class="old-text">${escapeHtml(e.oldText)}</span>
       <span style="color:var(--muted)">→</span>
-      <span class="new-text">${edit.newText}</span>
-      <span class="undo-btn" data-index="${index}">✕</span>
-    </div>
-  `).join('');
-  
-  // Add undo handlers
-  document.querySelectorAll('.text-edit-item .undo-btn').forEach(btn => {
-    btn.onclick = () => {
-      const index = parseInt(btn.dataset.index);
-      const edit = textEdits[index];
-      
-      // Find and restore the text item
-      const textItems = document.querySelectorAll('.text-layer .text-item');
-      textItems.forEach(item => {
-        if (parseInt(item.dataset.pageIndex) === edit.pageIndex && 
-            parseInt(item.dataset.itemIndex) === edit.textItemIndex) {
-          const displaySpan = item.querySelector('.text-display');
-          if (displaySpan) {
-            displaySpan.textContent = edit.oldText;
-          }
-          item.classList.remove('edited');
-        }
-      });
-      
-      textEdits.splice(index, 1);
-      updateEditList();
-      toast('Edit removed ✓');
-    };
+      <span class="new-text">${escapeHtml(e.newText) || '(deleted)'}</span>
+      <span class="undo-btn" data-index="${i}" title="Undo this edit (and everything after it)">↩</span>
+    </div>`).join('');
+  list.querySelectorAll('.undo-btn').forEach(btn => {
+    btn.onclick = () => undoToEdit(parseInt(btn.dataset.index, 10));
   });
 }
 
-// ===== NEW: APPLY TEXT EDITS TO PDF =====
-$('#applyTextEdits').onclick = async () => {
-  if (!workDoc || textEdits.length === 0) {
-    return toast('No text edits to apply');
-  }
-  
-  try {
-    const doc = await PDFDocument.load(workDoc);
-    const pages = doc.getPages();
-    const helveticaFont = await doc.embedFont(StandardFonts.Helvetica);
-    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
-    
-    // Group edits by page
-    const editsByPage = {};
-    textEdits.forEach(edit => {
-      if (!editsByPage[edit.pageIndex]) editsByPage[edit.pageIndex] = [];
-      editsByPage[edit.pageIndex].push(edit);
-    });
-    
-    // Apply edits to each page
-    for (const [pageIndex, edits] of Object.entries(editsByPage)) {
-      const page = pages[parseInt(pageIndex)];
-      const { width: pageWidth, height: pageHeight } = page.getSize();
-      
-      edits.forEach(edit => {
-        // Calculate position (convert from PDF coordinates)
-        const x = edit.x;
-        const y = pageHeight - edit.y - (edit.fontSize * 0.3); // Adjust for baseline
-        
-        // Draw white rectangle to cover old text
-        page.drawRectangle({
-          x: x - 2,
-          y: y - 2,
-          width: Math.max(edit.width, edit.newText.length * edit.fontSize * 0.6) + 4,
-          height: edit.fontSize + 4,
-          color: rgb(1, 1, 1),
-          borderWidth: 0
-        });
-        
-        // Draw new text
-        page.drawText(edit.newText, {
-          x: x,
-          y: y,
-          size: edit.fontSize,
-          font: helveticaFont,
-          color: rgb(0, 0, 0)
-        });
-      });
-    }
-    
-    workDoc = await doc.save();
-    textEdits = []; // Clear edits after applying
-    updateEditList();
-    await refreshThumbs();
-    await renderPdfForEditing();
-    toast('All text edits applied to PDF ✓');
-  } catch (err) {
-    console.error('Error applying text edits:', err);
-    toast('Error applying edits: ' + err.message);
-  }
-};
-
-// ===== NEW: CLEAR ALL EDITS =====
-$('#clearTextEdits').onclick = () => {
-  if (textEdits.length === 0) return;
-  
-  // Restore all spans
-  textEdits.forEach(edit => {
-    const spans = document.querySelectorAll('.text-layer span');
-    spans.forEach(span => {
-      if (parseInt(span.dataset.pageIndex) === edit.pageIndex && 
-          parseInt(span.dataset.itemIndex) === edit.textItemIndex) {
-        span.textContent = edit.oldText;
-        span.style.color = '';
-      }
-    });
-  });
-  
-  textEdits = [];
+async function undoToEdit(i) {
+  if (i < 0 || i >= editHistory.length) return;
+  workDoc = editHistory[i].snapshot.slice();
+  editHistory = editHistory.slice(0, i);
   updateEditList();
-  toast('All edits cleared ✓');
-};
+  await refreshThumbs();
+  await renderPdfForEditing();
+  toast('Undone ✓');
+}
+
+$('#undoTextEdit').onclick = () => undoToEdit(editHistory.length - 1);
+
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' &&
+      !(e.target && e.target.matches && e.target.matches('input, textarea'))) {
+    if (editHistory.length) { e.preventDefault(); undoToEdit(editHistory.length - 1); }
+  }
+});
 
 async function refreshThumbs() {
   const wrap = $('#pdfThumbs');
