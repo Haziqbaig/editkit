@@ -79,6 +79,7 @@
     margin: 0 auto 20px; 
     display: block;
     width: fit-content;
+    box-shadow: 0 4px 20px rgba(0,0,0,.3);
   }
   .pdf-page-canvas { 
     display: block; 
@@ -92,53 +93,78 @@
     width: 100%;
     height: 100%;
     pointer-events: none; 
+    z-index: 10;
   }
-  .text-layer span { 
-    position: absolute; 
-    white-space: pre; 
-    cursor: text; 
-    pointer-events: auto; 
+  .text-layer .text-item {
+    position: absolute;
+    white-space: pre;
+    cursor: pointer;
+    pointer-events: auto;
     transform-origin: 0% 0%;
     color: transparent;
-  }
-  .text-layer span:hover { 
-    background: rgba(108,140,255,.2); 
+    background: transparent;
+    border: 1px solid transparent;
     border-radius: 2px;
-    color: rgba(108,140,255,.8);
+    padding: 1px 3px;
+    transition: all 0.15s ease;
+    min-width: 20px;
+    min-height: 14px;
   }
-  .text-layer span.editing { 
-    background: rgba(108,140,255,.3); 
-    outline: 2px solid var(--accent); 
-    border-radius: 2px; 
+  .text-layer .text-item:hover {
+    background: rgba(108,140,255,.15);
+    border-color: var(--accent);
+    color: rgba(255,255,255,.7);
   }
-  .edit-popup {
+  .text-layer .text-item.editing {
+    background: rgba(108,140,255,.25);
+    border-color: var(--accent);
+    outline: none;
+  }
+  .text-layer .text-item .text-display {
+    display: inline;
+    pointer-events: none;
+  }
+  .text-layer .text-item .text-input {
     position: absolute;
+    top: -2px;
+    left: -2px;
+    width: calc(100% + 20px);
+    min-width: 80px;
+    padding: 2px 6px;
     background: var(--panel2);
-    border: 1px solid var(--accent);
-    border-radius: 10px;
-    padding: 12px;
+    color: var(--text);
+    border: 2px solid var(--accent);
+    border-radius: 4px;
+    font-size: inherit;
+    font-family: inherit;
+    outline: none;
     z-index: 100;
-    min-width: 200px;
-    box-shadow: 0 8px 30px rgba(0,0,0,.5);
+    box-shadow: 0 4px 15px rgba(0,0,0,.4);
+    white-space: pre;
   }
-  .edit-popup input { margin-bottom: 8px; }
-  .edit-popup .popup-actions { display: flex; gap: 8px; }
-  .edit-popup .popup-actions .btn { flex: 1; margin: 0; }
-  .text-edit-list { max-height: 300px; overflow-y: auto; }
-  .text-edit-item {
+  .text-layer .text-item .text-actions {
+    position: absolute;
+    top: -30px;
+    left: 0;
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px;
-    background: var(--panel2);
-    border-radius: 8px;
-    margin-bottom: 6px;
-    font-size: .85rem;
+    gap: 4px;
+    z-index: 101;
   }
-  .text-edit-item .old-text { color: var(--danger); text-decoration: line-through; flex: 1; }
-  .text-edit-item .new-text { color: var(--ok); flex: 1; }
-  .text-edit-item .page-num { color: var(--muted); font-size: .75rem; }
-  .text-edit-item .undo-btn { color: var(--danger); cursor: pointer; padding: 2px 6px; }
+  .text-layer .text-item .text-actions .action-btn {
+    padding: 2px 8px;
+    font-size: 11px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    color: #fff;
+    font-weight: 600;
+  }
+  .text-layer .text-item .text-actions .save-btn {
+    background: var(--ok);
+  }
+  .text-layer .text-item .text-actions .cancel-btn {
+    background: var(--danger);
+  }
   .edit-badge {
     display: inline-block;
     background: var(--accent);
@@ -583,36 +609,48 @@ async function renderPdfForEditing() {
       uniqueItems.forEach(({ item, itemIndex }) => {
         const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
         const fontHeight = Math.hypot(tx[0], tx[1]);
+        const fontWidth = Math.hypot(tx[2], tx[3]);
         
-        const span = document.createElement('span');
-        span.textContent = item.str;
-        span.style.left = tx[4] + 'px';
-        span.style.top = (tx[5] - fontHeight) + 'px';
-        span.style.fontSize = fontHeight + 'px';
-        span.style.fontFamily = item.fontName || 'sans-serif';
-        span.dataset.pageIndex = pageNum - 1;
-        span.dataset.itemIndex = itemIndex;
-        span.dataset.originalText = item.str;
-        span.dataset.x = tx[4];
-        span.dataset.y = tx[5];
-        span.dataset.fontSize = fontHeight;
-        span.dataset.fontName = item.fontName || 'Helvetica';
+        // Create text item container
+        const textItem = document.createElement('div');
+        textItem.className = 'text-item';
+        textItem.style.left = tx[4] + 'px';
+        textItem.style.top = (tx[5] - fontHeight * 0.8) + 'px';
+        textItem.style.fontSize = fontHeight + 'px';
+        textItem.style.fontFamily = item.fontName || 'sans-serif';
+        textItem.style.minWidth = (fontWidth || fontHeight * item.str.length * 0.5) + 'px';
+        textItem.style.height = (fontHeight * 1.2) + 'px';
+        textItem.dataset.pageIndex = pageNum - 1;
+        textItem.dataset.itemIndex = itemIndex;
+        textItem.dataset.originalText = item.str;
+        textItem.dataset.x = tx[4];
+        textItem.dataset.y = tx[5];
+        textItem.dataset.fontSize = fontHeight;
+        textItem.dataset.fontName = item.fontName || 'Helvetica';
+        
+        // Create display span
+        const displaySpan = document.createElement('span');
+        displaySpan.className = 'text-display';
+        displaySpan.textContent = item.str;
+        textItem.appendChild(displaySpan);
         
         // Check if this text has been edited
         const existingEdit = textEdits.find(e => 
           e.pageIndex === pageNum - 1 && e.textItemIndex === itemIndex
         );
         if (existingEdit) {
-          span.textContent = existingEdit.newText;
-          span.style.color = '#5fd4a2'; // Green for edited text
+          displaySpan.textContent = existingEdit.newText;
+          textItem.classList.add('edited');
         }
         
-        span.onclick = (e) => {
+        // Click to edit inline
+        textItem.onclick = (e) => {
           e.stopPropagation();
-          openTextEditor(span, pageNum - 1, itemIndex);
+          e.preventDefault();
+          startInlineEdit(textItem, pageNum - 1, itemIndex);
         };
         
-        textLayer.appendChild(span);
+        textLayer.appendChild(textItem);
       });
       
       pageContainer.appendChild(canvas);
@@ -627,41 +665,52 @@ async function renderPdfForEditing() {
   }
 }
 
-// ===== NEW: OPEN TEXT EDITOR POPUP =====
-function openTextEditor(span, pageIndex, itemIndex) {
-  // Remove any existing popup
-  const existingPopup = document.querySelector('.edit-popup');
-  if (existingPopup) existingPopup.remove();
+// ===== NEW: INLINE TEXT EDITOR =====
+function startInlineEdit(textItem, pageIndex, itemIndex) {
+  // Close any existing inline editor
+  const existingEditor = document.querySelector('.text-item.editing');
+  if (existingEditor) {
+    cancelInlineEdit(existingEditor);
+  }
   
-  const popup = document.createElement('div');
-  popup.className = 'edit-popup';
+  textItem.classList.add('editing');
   
-  const originalText = span.dataset.originalText;
-  const currentText = span.textContent;
+  const displaySpan = textItem.querySelector('.text-display');
+  const originalText = textItem.dataset.originalText;
+  const currentText = displaySpan.textContent;
   
-  popup.innerHTML = `
-    <label style="font-size:.8rem;color:var(--muted)">Original: <span style="text-decoration:line-through;color:var(--danger)">${originalText}</span></label>
-    <input type="text" id="editTextInput" value="${currentText}" placeholder="Enter new text..." style="margin-top:6px">
-    <div class="popup-actions" style="margin-top:8px">
-      <button class="btn" id="cancelEdit">Cancel</button>
-      <button class="btn primary" id="saveEdit">Save</button>
-    </div>
+  // Create input
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'text-input';
+  input.value = currentText;
+  input.style.fontSize = textItem.style.fontSize;
+  input.style.fontFamily = textItem.style.fontFamily;
+  
+  // Create action buttons
+  const actions = document.createElement('div');
+  actions.className = 'text-actions';
+  actions.innerHTML = `
+    <button class="action-btn save-btn">✓ Save</button>
+    <button class="action-btn cancel-btn">✕ Cancel</button>
   `;
   
-  // Position popup near the text
-  const rect = span.getBoundingClientRect();
-  const containerRect = $('#pdfViewerContainer').getBoundingClientRect();
-  popup.style.left = (rect.left - containerRect.left + 20) + 'px';
-  popup.style.top = (rect.top - containerRect.top - 10) + 'px';
+  // Hide display, show input
+  displaySpan.style.display = 'none';
+  textItem.appendChild(input);
+  textItem.appendChild(actions);
   
-  $('#pdfViewerContainer').appendChild(popup);
-  
-  // Focus input
-  setTimeout(() => $('#editTextInput').focus(), 10);
+  // Focus and select all
+  input.focus();
+  input.select();
   
   // Handle save
-  $('#saveEdit').onclick = () => {
-    const newText = $('#editTextInput').value;
+  const saveBtn = actions.querySelector('.save-btn');
+  const cancelBtn = actions.querySelector('.cancel-btn');
+  
+  const saveEdit = () => {
+    const newText = input.value;
+    
     if (newText !== originalText) {
       // Update or add edit
       const existingIndex = textEdits.findIndex(e => 
@@ -673,12 +722,12 @@ function openTextEditor(span, pageIndex, itemIndex) {
         textItemIndex: itemIndex,
         oldText: originalText,
         newText: newText,
-        x: parseFloat(span.dataset.x),
-        y: parseFloat(span.dataset.y),
-        fontSize: parseFloat(span.dataset.fontSize),
-        fontName: span.dataset.fontName,
-        width: span.offsetWidth,
-        height: span.offsetHeight
+        x: parseFloat(textItem.dataset.x),
+        y: parseFloat(textItem.dataset.y),
+        fontSize: parseFloat(textItem.dataset.fontSize),
+        fontName: textItem.dataset.fontName,
+        width: textItem.offsetWidth,
+        height: textItem.offsetHeight
       };
       
       if (existingIndex >= 0) {
@@ -687,30 +736,72 @@ function openTextEditor(span, pageIndex, itemIndex) {
         textEdits.push(editData);
       }
       
-      // Update span visually
-      span.textContent = newText;
-      span.style.color = '#5fd4a2';
+      displaySpan.textContent = newText;
+      textItem.classList.add('edited');
       
       updateEditList();
       toast('Text edit saved ✓');
     }
-    popup.remove();
+    
+    cancelInlineEdit(textItem);
   };
   
-  // Handle cancel
-  $('#cancelEdit').onclick = () => {
-    popup.remove();
+  const cancelEdit = () => {
+    cancelInlineEdit(textItem);
+  };
+  
+  saveBtn.onclick = (e) => {
+    e.stopPropagation();
+    saveEdit();
+  };
+  
+  cancelBtn.onclick = (e) => {
+    e.stopPropagation();
+    cancelEdit();
+  };
+  
+  // Handle keyboard
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelEdit();
+    }
   };
   
   // Close on outside click
   setTimeout(() => {
-    document.addEventListener('click', function closePopup(e) {
-      if (!popup.contains(e.target)) {
-        popup.remove();
-        document.removeEventListener('click', closePopup);
+    const outsideClickHandler = (e) => {
+      if (!textItem.contains(e.target)) {
+        saveEdit();
+        document.removeEventListener('click', outsideClickHandler);
       }
-    });
+    };
+    document.addEventListener('click', outsideClickHandler);
+    
+    // Store handler for cleanup
+    textItem._outsideClickHandler = outsideClickHandler;
   }, 100);
+}
+
+function cancelInlineEdit(textItem) {
+  textItem.classList.remove('editing');
+  
+  const input = textItem.querySelector('.text-input');
+  const actions = textItem.querySelector('.text-actions');
+  const displaySpan = textItem.querySelector('.text-display');
+  
+  if (input) input.remove();
+  if (actions) actions.remove();
+  if (displaySpan) displaySpan.style.display = 'inline';
+  
+  // Remove outside click handler
+  if (textItem._outsideClickHandler) {
+    document.removeEventListener('click', textItem._outsideClickHandler);
+    delete textItem._outsideClickHandler;
+  }
 }
 
 // ===== NEW: UPDATE EDIT LIST =====
@@ -739,13 +830,16 @@ function updateEditList() {
       const index = parseInt(btn.dataset.index);
       const edit = textEdits[index];
       
-      // Find and restore the span
-      const spans = document.querySelectorAll('.text-layer span');
-      spans.forEach(span => {
-        if (parseInt(span.dataset.pageIndex) === edit.pageIndex && 
-            parseInt(span.dataset.itemIndex) === edit.textItemIndex) {
-          span.textContent = edit.oldText;
-          span.style.color = '';
+      // Find and restore the text item
+      const textItems = document.querySelectorAll('.text-layer .text-item');
+      textItems.forEach(item => {
+        if (parseInt(item.dataset.pageIndex) === edit.pageIndex && 
+            parseInt(item.dataset.itemIndex) === edit.textItemIndex) {
+          const displaySpan = item.querySelector('.text-display');
+          if (displaySpan) {
+            displaySpan.textContent = edit.oldText;
+          }
+          item.classList.remove('edited');
         }
       });
       
