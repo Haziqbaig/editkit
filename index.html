@@ -60,13 +60,57 @@
   footer { text-align: center; color: var(--muted); font-size: .78rem; padding: 20px; }
 
   /* ===== PDF TEXT EDITOR OVERLAY ===== */
-  .pdf-viewer-container { position: relative; width: 100%; min-height: 500px; }
-  .pdf-page-container { position: relative; margin: 0 auto 20px; display: inline-block; }
-  .pdf-page-canvas { display: block; }
-  .text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; }
-  .text-layer span { position: absolute; white-space: pre; cursor: text; pointer-events: auto; transform-origin: 0% 0%; }
-  .text-layer span:hover { background: rgba(108,140,255,.15); border-radius: 2px; }
-  .text-layer span.editing { background: rgba(108,140,255,.3); outline: 2px solid var(--accent); border-radius: 2px; }
+  .pdf-viewer-container { 
+    position: relative; 
+    width: 100%; 
+    max-height: 70vh; 
+    overflow-y: auto; 
+    overflow-x: hidden;
+    background: var(--bg);
+    border-radius: 8px;
+    padding: 10px;
+  }
+  .pdf-viewer-container::-webkit-scrollbar { width: 8px; }
+  .pdf-viewer-container::-webkit-scrollbar-track { background: var(--panel); border-radius: 4px; }
+  .pdf-viewer-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  .pdf-viewer-container::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+  .pdf-page-container { 
+    position: relative; 
+    margin: 0 auto 20px; 
+    display: block;
+    width: fit-content;
+  }
+  .pdf-page-canvas { 
+    display: block; 
+    max-width: 100%;
+    height: auto;
+  }
+  .text-layer { 
+    position: absolute; 
+    top: 0; 
+    left: 0; 
+    width: 100%;
+    height: 100%;
+    pointer-events: none; 
+  }
+  .text-layer span { 
+    position: absolute; 
+    white-space: pre; 
+    cursor: text; 
+    pointer-events: auto; 
+    transform-origin: 0% 0%;
+    color: transparent;
+  }
+  .text-layer span:hover { 
+    background: rgba(108,140,255,.2); 
+    border-radius: 2px;
+    color: rgba(108,140,255,.8);
+  }
+  .text-layer span.editing { 
+    background: rgba(108,140,255,.3); 
+    outline: 2px solid var(--accent); 
+    border-radius: 2px; 
+  }
   .edit-popup {
     position: absolute;
     background: var(--panel2);
@@ -525,15 +569,25 @@ async function renderPdfForEditing() {
       // Get text content
       const textContent = await page.getTextContent();
       
-      textContent.items.forEach((item, itemIndex) => {
+      // Remove duplicate text items (PDF.js sometimes returns duplicates)
+      const uniqueItems = [];
+      const seen = new Set();
+      textContent.items.forEach((item, idx) => {
+        const key = `${item.str}|${Math.round(item.transform[4])}|${Math.round(item.transform[5])}`;
+        if (!seen.has(key) && item.str.trim()) {
+          seen.add(key);
+          uniqueItems.push({ item, idx });
+        }
+      });
+      
+      uniqueItems.forEach(({ item, itemIndex }) => {
         const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
         const fontHeight = Math.hypot(tx[0], tx[1]);
-        const fontWidth = Math.hypot(tx[2], tx[3]);
         
         const span = document.createElement('span');
         span.textContent = item.str;
         span.style.left = tx[4] + 'px';
-        span.style.top = tx[5] + 'px';
+        span.style.top = (tx[5] - fontHeight) + 'px';
         span.style.fontSize = fontHeight + 'px';
         span.style.fontFamily = item.fontName || 'sans-serif';
         span.dataset.pageIndex = pageNum - 1;
@@ -565,7 +619,7 @@ async function renderPdfForEditing() {
       pageContainer.appendChild(textLayer);
       container.appendChild(pageContainer);
       
-      currentPdfPages.push({ page, viewport, textContent });
+      currentPdfPages.push({ page, viewport, textContent: { items: uniqueItems.map(u => u.item) } });
     }
   } catch (err) {
     console.error('Error rendering PDF for editing:', err);
