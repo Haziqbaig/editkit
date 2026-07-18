@@ -22,17 +22,18 @@
   .tab.active { background: var(--panel2); color: var(--text); border-color: var(--accent); }
   .page { display: none; padding: 22px 28px; }
   .page.active { display: block; }
-  .layout { display: grid; grid-template-columns: 300px 1fr; gap: 20px; }
+  .layout { display: grid; grid-template-columns: 320px 1fr; gap: 20px; }
   @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
   .panel h3 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 12px; }
   .group { margin-bottom: 18px; }
   label { display: block; font-size: .85rem; color: var(--muted); margin: 8px 0 4px; }
   input[type=range] { width: 100%; accent-color: var(--accent); }
-  input[type=text], input[type=number], select {
+  input[type=text], input[type=number], select, textarea {
     width: 100%; padding: 8px 10px; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 8px; font-size: .9rem;
   }
+  textarea { min-height: 60px; resize: vertical; }
   .btn { display: inline-block; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel2); color: var(--text); cursor: pointer; font-size: .88rem; margin: 3px 2px; transition: all .15s; }
   .btn:hover { border-color: var(--accent); }
   .btn.primary { background: linear-gradient(90deg, var(--accent), var(--accent2)); border: none; color: #fff; font-weight: 600; }
@@ -57,6 +58,52 @@
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   footer { text-align: center; color: var(--muted); font-size: .78rem; padding: 20px; }
+
+  /* ===== PDF TEXT EDITOR OVERLAY ===== */
+  .pdf-viewer-container { position: relative; width: 100%; min-height: 500px; }
+  .pdf-page-container { position: relative; margin: 0 auto 20px; display: inline-block; }
+  .pdf-page-canvas { display: block; }
+  .text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; }
+  .text-layer span { position: absolute; white-space: pre; cursor: text; pointer-events: auto; transform-origin: 0% 0%; }
+  .text-layer span:hover { background: rgba(108,140,255,.15); border-radius: 2px; }
+  .text-layer span.editing { background: rgba(108,140,255,.3); outline: 2px solid var(--accent); border-radius: 2px; }
+  .edit-popup {
+    position: absolute;
+    background: var(--panel2);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    padding: 12px;
+    z-index: 100;
+    min-width: 200px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  }
+  .edit-popup input { margin-bottom: 8px; }
+  .edit-popup .popup-actions { display: flex; gap: 8px; }
+  .edit-popup .popup-actions .btn { flex: 1; margin: 0; }
+  .text-edit-list { max-height: 300px; overflow-y: auto; }
+  .text-edit-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px;
+    background: var(--panel2);
+    border-radius: 8px;
+    margin-bottom: 6px;
+    font-size: .85rem;
+  }
+  .text-edit-item .old-text { color: var(--danger); text-decoration: line-through; flex: 1; }
+  .text-edit-item .new-text { color: var(--ok); flex: 1; }
+  .text-edit-item .page-num { color: var(--muted); font-size: .75rem; }
+  .text-edit-item .undo-btn { color: var(--danger); cursor: pointer; padding: 2px 6px; }
+  .edit-badge {
+    display: inline-block;
+    background: var(--accent);
+    color: #fff;
+    font-size: .7rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    margin-left: 8px;
+  }
 </style>
 </head>
 <body>
@@ -170,6 +217,15 @@
         </div>
       </div>
 
+      <!-- ===== NEW: EDIT EXISTING TEXT ===== -->
+      <div class="panel" style="margin-top:16px">
+        <h3>✏️ Edit Existing Text <span class="edit-badge" id="editCount">0 edits</span></h3>
+        <p class="hint">Click on any text in the PDF preview to edit it directly. Changes are tracked and can be applied to the document.</p>
+        <div class="text-edit-list" id="textEditList"></div>
+        <button class="btn wide primary" style="margin-top:10px" id="applyTextEdits">💾 Apply All Text Edits</button>
+        <button class="btn wide danger" style="margin-top:6px" id="clearTextEdits">Clear All Edits</button>
+      </div>
+
       <div class="panel" style="margin-top:16px">
         <h3>Merge</h3>
         <p class="hint">Load multiple PDFs above — they merge in list order.</p>
@@ -232,6 +288,13 @@
       <div class="panel">
         <h3>Pages <span class="hint" id="pdfInfo"></span></h3>
         <div class="thumbs" id="pdfThumbs"><p class="hint">Load a PDF to see pages…</p></div>
+      </div>
+      <!-- ===== NEW: PDF TEXT EDITOR VIEWER ===== -->
+      <div class="panel" style="margin-top:16px">
+        <h3>📄 PDF Text Editor <span class="hint">Click any text to edit</span></h3>
+        <div class="pdf-viewer-container" id="pdfViewerContainer">
+          <p class="hint">Load a PDF to enable text editing…</p>
+        </div>
       </div>
     </div>
   </div>
@@ -390,13 +453,22 @@ let pdfFiles = []; // {name, bytes}
 let workDoc = null; // current pdf-lib doc bytes
 let selectedPages = new Set();
 
+// ===== NEW: TEXT EDITING STATE =====
+let textEdits = []; // { pageIndex, oldText, newText, textItemIndex, x, y, fontSize, fontName, width, height }
+let currentPdfDoc = null; // pdfjs document for text extraction
+let currentPdfPages = []; // rendered page data
+
 setupDrop($('#pdfDrop'), $('#pdfFile'), async files => {
   for (const f of files) {
     if (f.type !== 'application/pdf') continue;
     pdfFiles.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
   }
   renderFileList();
-  if (pdfFiles.length && !workDoc) { workDoc = pdfFiles[0].bytes.slice(); await refreshThumbs(); }
+  if (pdfFiles.length && !workDoc) { 
+    workDoc = pdfFiles[0].bytes.slice(); 
+    await refreshThumbs(); 
+    await renderPdfForEditing(); // NEW: render for text editing
+  }
   toast(pdfFiles.length + ' PDF(s) loaded');
 });
 function renderFileList() {
@@ -405,9 +477,314 @@ function renderFileList() {
   document.querySelectorAll('#pdfList .x').forEach(x => x.onclick = async () => {
     pdfFiles.splice(+x.dataset.i, 1); renderFileList();
     workDoc = pdfFiles.length ? pdfFiles[0].bytes.slice() : null;
-    selectedPages.clear(); await refreshThumbs();
+    selectedPages.clear(); 
+    textEdits = []; // Clear edits when changing PDF
+    updateEditList();
+    await refreshThumbs();
+    await renderPdfForEditing();
   });
 }
+
+// ===== NEW: RENDER PDF FOR TEXT EDITING =====
+async function renderPdfForEditing() {
+  const container = $('#pdfViewerContainer');
+  if (!workDoc) {
+    container.innerHTML = '<p class="hint">Load a PDF to enable text editing…</p>';
+    return;
+  }
+  
+  container.innerHTML = '';
+  currentPdfPages = [];
+  
+  try {
+    currentPdfDoc = await pdfjsLib.getDocument({ data: workDoc.slice() }).promise;
+    
+    for (let pageNum = 1; pageNum <= currentPdfDoc.numPages; pageNum++) {
+      const page = await currentPdfDoc.getPage(pageNum);
+      const viewport = page.getViewport({ scale: 1.5 });
+      
+      // Create page container
+      const pageContainer = document.createElement('div');
+      pageContainer.className = 'pdf-page-container';
+      pageContainer.style.width = viewport.width + 'px';
+      pageContainer.style.height = viewport.height + 'px';
+      
+      // Create canvas for rendering
+      const canvas = document.createElement('canvas');
+      canvas.className = 'pdf-page-canvas';
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      
+      const canvasContext = canvas.getContext('2d');
+      await page.render({ canvasContext, viewport }).promise;
+      
+      // Create text layer for editing
+      const textLayer = document.createElement('div');
+      textLayer.className = 'text-layer';
+      
+      // Get text content
+      const textContent = await page.getTextContent();
+      
+      textContent.items.forEach((item, itemIndex) => {
+        const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+        const fontHeight = Math.hypot(tx[0], tx[1]);
+        const fontWidth = Math.hypot(tx[2], tx[3]);
+        
+        const span = document.createElement('span');
+        span.textContent = item.str;
+        span.style.left = tx[4] + 'px';
+        span.style.top = tx[5] + 'px';
+        span.style.fontSize = fontHeight + 'px';
+        span.style.fontFamily = item.fontName || 'sans-serif';
+        span.dataset.pageIndex = pageNum - 1;
+        span.dataset.itemIndex = itemIndex;
+        span.dataset.originalText = item.str;
+        span.dataset.x = tx[4];
+        span.dataset.y = tx[5];
+        span.dataset.fontSize = fontHeight;
+        span.dataset.fontName = item.fontName || 'Helvetica';
+        
+        // Check if this text has been edited
+        const existingEdit = textEdits.find(e => 
+          e.pageIndex === pageNum - 1 && e.textItemIndex === itemIndex
+        );
+        if (existingEdit) {
+          span.textContent = existingEdit.newText;
+          span.style.color = '#5fd4a2'; // Green for edited text
+        }
+        
+        span.onclick = (e) => {
+          e.stopPropagation();
+          openTextEditor(span, pageNum - 1, itemIndex);
+        };
+        
+        textLayer.appendChild(span);
+      });
+      
+      pageContainer.appendChild(canvas);
+      pageContainer.appendChild(textLayer);
+      container.appendChild(pageContainer);
+      
+      currentPdfPages.push({ page, viewport, textContent });
+    }
+  } catch (err) {
+    console.error('Error rendering PDF for editing:', err);
+    container.innerHTML = '<p class="hint">Error loading PDF for text editing. The PDF may be scanned or image-based.</p>';
+  }
+}
+
+// ===== NEW: OPEN TEXT EDITOR POPUP =====
+function openTextEditor(span, pageIndex, itemIndex) {
+  // Remove any existing popup
+  const existingPopup = document.querySelector('.edit-popup');
+  if (existingPopup) existingPopup.remove();
+  
+  const popup = document.createElement('div');
+  popup.className = 'edit-popup';
+  
+  const originalText = span.dataset.originalText;
+  const currentText = span.textContent;
+  
+  popup.innerHTML = `
+    <label style="font-size:.8rem;color:var(--muted)">Original: <span style="text-decoration:line-through;color:var(--danger)">${originalText}</span></label>
+    <input type="text" id="editTextInput" value="${currentText}" placeholder="Enter new text..." style="margin-top:6px">
+    <div class="popup-actions" style="margin-top:8px">
+      <button class="btn" id="cancelEdit">Cancel</button>
+      <button class="btn primary" id="saveEdit">Save</button>
+    </div>
+  `;
+  
+  // Position popup near the text
+  const rect = span.getBoundingClientRect();
+  const containerRect = $('#pdfViewerContainer').getBoundingClientRect();
+  popup.style.left = (rect.left - containerRect.left + 20) + 'px';
+  popup.style.top = (rect.top - containerRect.top - 10) + 'px';
+  
+  $('#pdfViewerContainer').appendChild(popup);
+  
+  // Focus input
+  setTimeout(() => $('#editTextInput').focus(), 10);
+  
+  // Handle save
+  $('#saveEdit').onclick = () => {
+    const newText = $('#editTextInput').value;
+    if (newText !== originalText) {
+      // Update or add edit
+      const existingIndex = textEdits.findIndex(e => 
+        e.pageIndex === pageIndex && e.textItemIndex === itemIndex
+      );
+      
+      const editData = {
+        pageIndex,
+        textItemIndex: itemIndex,
+        oldText: originalText,
+        newText: newText,
+        x: parseFloat(span.dataset.x),
+        y: parseFloat(span.dataset.y),
+        fontSize: parseFloat(span.dataset.fontSize),
+        fontName: span.dataset.fontName,
+        width: span.offsetWidth,
+        height: span.offsetHeight
+      };
+      
+      if (existingIndex >= 0) {
+        textEdits[existingIndex] = editData;
+      } else {
+        textEdits.push(editData);
+      }
+      
+      // Update span visually
+      span.textContent = newText;
+      span.style.color = '#5fd4a2';
+      
+      updateEditList();
+      toast('Text edit saved ✓');
+    }
+    popup.remove();
+  };
+  
+  // Handle cancel
+  $('#cancelEdit').onclick = () => {
+    popup.remove();
+  };
+  
+  // Close on outside click
+  setTimeout(() => {
+    document.addEventListener('click', function closePopup(e) {
+      if (!popup.contains(e.target)) {
+        popup.remove();
+        document.removeEventListener('click', closePopup);
+      }
+    });
+  }, 100);
+}
+
+// ===== NEW: UPDATE EDIT LIST =====
+function updateEditList() {
+  const list = $('#textEditList');
+  $('#editCount').textContent = textEdits.length + ' edits';
+  
+  if (textEdits.length === 0) {
+    list.innerHTML = '<p class="hint">No text edits yet. Click on any text in the PDF preview to edit.</p>';
+    return;
+  }
+  
+  list.innerHTML = textEdits.map((edit, index) => `
+    <div class="text-edit-item">
+      <span class="page-num">P${edit.pageIndex + 1}</span>
+      <span class="old-text">${edit.oldText}</span>
+      <span style="color:var(--muted)">→</span>
+      <span class="new-text">${edit.newText}</span>
+      <span class="undo-btn" data-index="${index}">✕</span>
+    </div>
+  `).join('');
+  
+  // Add undo handlers
+  document.querySelectorAll('.text-edit-item .undo-btn').forEach(btn => {
+    btn.onclick = () => {
+      const index = parseInt(btn.dataset.index);
+      const edit = textEdits[index];
+      
+      // Find and restore the span
+      const spans = document.querySelectorAll('.text-layer span');
+      spans.forEach(span => {
+        if (parseInt(span.dataset.pageIndex) === edit.pageIndex && 
+            parseInt(span.dataset.itemIndex) === edit.textItemIndex) {
+          span.textContent = edit.oldText;
+          span.style.color = '';
+        }
+      });
+      
+      textEdits.splice(index, 1);
+      updateEditList();
+      toast('Edit removed ✓');
+    };
+  });
+}
+
+// ===== NEW: APPLY TEXT EDITS TO PDF =====
+$('#applyTextEdits').onclick = async () => {
+  if (!workDoc || textEdits.length === 0) {
+    return toast('No text edits to apply');
+  }
+  
+  try {
+    const doc = await PDFDocument.load(workDoc);
+    const pages = doc.getPages();
+    const helveticaFont = await doc.embedFont(StandardFonts.Helvetica);
+    const helveticaBold = await doc.embedFont(StandardFonts.HelveticaBold);
+    
+    // Group edits by page
+    const editsByPage = {};
+    textEdits.forEach(edit => {
+      if (!editsByPage[edit.pageIndex]) editsByPage[edit.pageIndex] = [];
+      editsByPage[edit.pageIndex].push(edit);
+    });
+    
+    // Apply edits to each page
+    for (const [pageIndex, edits] of Object.entries(editsByPage)) {
+      const page = pages[parseInt(pageIndex)];
+      const { width: pageWidth, height: pageHeight } = page.getSize();
+      
+      edits.forEach(edit => {
+        // Calculate position (convert from PDF coordinates)
+        const x = edit.x;
+        const y = pageHeight - edit.y - (edit.fontSize * 0.3); // Adjust for baseline
+        
+        // Draw white rectangle to cover old text
+        page.drawRectangle({
+          x: x - 2,
+          y: y - 2,
+          width: Math.max(edit.width, edit.newText.length * edit.fontSize * 0.6) + 4,
+          height: edit.fontSize + 4,
+          color: rgb(1, 1, 1),
+          borderWidth: 0
+        });
+        
+        // Draw new text
+        page.drawText(edit.newText, {
+          x: x,
+          y: y,
+          size: edit.fontSize,
+          font: helveticaFont,
+          color: rgb(0, 0, 0)
+        });
+      });
+    }
+    
+    workDoc = await doc.save();
+    textEdits = []; // Clear edits after applying
+    updateEditList();
+    await refreshThumbs();
+    await renderPdfForEditing();
+    toast('All text edits applied to PDF ✓');
+  } catch (err) {
+    console.error('Error applying text edits:', err);
+    toast('Error applying edits: ' + err.message);
+  }
+};
+
+// ===== NEW: CLEAR ALL EDITS =====
+$('#clearTextEdits').onclick = () => {
+  if (textEdits.length === 0) return;
+  
+  // Restore all spans
+  textEdits.forEach(edit => {
+    const spans = document.querySelectorAll('.text-layer span');
+    spans.forEach(span => {
+      if (parseInt(span.dataset.pageIndex) === edit.pageIndex && 
+          parseInt(span.dataset.itemIndex) === edit.textItemIndex) {
+        span.textContent = edit.oldText;
+        span.style.color = '';
+      }
+    });
+  });
+  
+  textEdits = [];
+  updateEditList();
+  toast('All edits cleared ✓');
+};
+
 async function refreshThumbs() {
   const wrap = $('#pdfThumbs');
   if (!workDoc) { wrap.innerHTML = '<p class="hint">Load a PDF to see pages…</p>'; $('#pdfInfo').textContent = ''; return; }
@@ -450,6 +827,7 @@ async function reorderPage(from, to) {
   workDoc = await out.save();
   selectedPages.clear();
   await refreshThumbs();
+  await renderPdfForEditing();
   toast(`Moved page ${from + 1} → position ${to + 1}`);
 }
 async function withDoc(fn) {
@@ -459,6 +837,7 @@ async function withDoc(fn) {
   workDoc = await doc.save();
   selectedPages.clear();
   await refreshThumbs();
+  await renderPdfForEditing();
 }
 $('#pdfRotSel').onclick = () => withDoc(async doc => {
   const pages = doc.getPages();
@@ -494,7 +873,7 @@ $('#pdfMerge').onclick = async () => {
     const src = await PDFDocument.load(f.bytes);
     (await out.copyPages(src, src.getPageIndices())).forEach(p => out.addPage(p));
   }
-  workDoc = await out.save(); selectedPages.clear(); await refreshThumbs(); toast('Merged into working doc ✓');
+  workDoc = await out.save(); selectedPages.clear(); await refreshThumbs(); await renderPdfForEditing(); toast('Merged into working doc ✓');
 };
 $('#pdfTextOp').oninput = () => $('#v-pdfop').textContent = $('#pdfTextOp').value + '%';
 $('#pdfStamp').onclick = () => withDoc(async doc => {
@@ -549,7 +928,7 @@ $('#imgToPdfFile').onchange = async e => {
     page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
   }
   const bytes = await out.save();
-  if (!workDoc) { workDoc = bytes; await refreshThumbs(); toast('PDF created from images — now the working doc'); }
+  if (!workDoc) { workDoc = bytes; await refreshThumbs(); await renderPdfForEditing(); toast('PDF created from images — now the working doc'); }
   else { downloadPdf(bytes, 'images.pdf'); toast('images.pdf downloaded ✓'); }
   e.target.value = '';
 };
