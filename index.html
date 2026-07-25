@@ -638,6 +638,8 @@ async function renderPdfForEditing() {
           realFontName: getRealFontName(page, item.fontName),
           fontFamily: (textContent.styles[item.fontName] || {}).fontFamily || '',
           fontCharset: charsByFont[item.fontName] || '',
+          showOpIndex: st.showOpIndex !== undefined ? st.showOpIndex : -1,
+          compositeFont: isCompositeFont(page, item.fontName),
           devX, devY, devW, devH,
         };
 
@@ -700,7 +702,10 @@ async function extractTextStyles(page, count) {
       else if (fn === OPS.setFont) fontRef = a[0];
       else if (fn === OPS.showText || fn === OPS.showSpacedText ||
                fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText) {
-        out[n++] = { color: fill.slice(), fontRef };
+        // n is also this item's ordinal among ALL text-showing operators on the
+        // page — the content-stream editor uses it to find the exact operator.
+        out[n] = { color: fill.slice(), fontRef, showOpIndex: n };
+        n++;
       }
     }
   } catch (e) { /* defaults are fine */ }
@@ -712,6 +717,16 @@ function getRealFontName(page, fontRef) {
     const obj = page.commonObjs.get(fontRef);
     return (obj && obj.name) || '';
   } catch (e) { return ''; }
+}
+
+// Composite (CID/Type0) fonts use multi-byte glyph indexes in the content
+// stream — we can't write plain text into those, so the editor falls back to
+// the overlay method for them.
+function isCompositeFont(page, fontRef) {
+  try {
+    const obj = page.commonObjs.get(fontRef);
+    return !!(obj && obj.composite);
+  } catch (e) { return false; }
 }
 
 // Map the original font onto the closest built-in PDF standard font so the
@@ -849,13 +864,92 @@ function cancelInlineEdit(textItem) {
   }
 }
 
-// Try to swap the text inside the page's raw content stream itself. When this
-// works it is a perfect edit: original font, spacing, color and background all
-// stay untouched — no rectangle is painted at all.
-function tryContentStreamEdit(doc, pageIndex, oldText, newText) {
+// ===== IN-PLACE CONTENT-STREAM EDITOR =====
+// Tokenizes the page's content stream, walks to the Nth text-showing operator
+// (Tj / TJ / ' / ") — the same ordinal pdf.js reported for the clicked item —
+// and swaps its string operand for the new text. Original font, kerning,
+// color, and background stay untouched: a perfect, invisible edit.
+
+function lexContentStream(src) {
+  // Returns positions of every text-showing operator with the span of its
+  // string operand(s), scanning strings/hex/dicts/comments correctly.
+  const shows = []; // { opStart, opEnd, operandStart, operandEnd, op }
+  let i = 0;
+  const n = src.length;
+  let lastOperands = []; // spans of string/array operands since last operator
+  const isDelim = c => ' \t\r\n\f\0()<>[]{}/%'.includes(c);
+  while (i < n) {
+    const c = src[i];
+    if (c === '%') { while (i < n && src[i] !== '\n' && src[i] !== '\r') i++; continue; }
+    if (c === '(') {
+      const start = i; let depth = 0;
+      while (i < n) {
+        const ch = src[i];
+        if (ch === '\\') { i += 2; continue; }
+        if (ch === '(') depth++;
+        else if (ch === ')') { depth--; if (!depth) { i++; break; } }
+        i++;
+      }
+      lastOperands.push({ start, end: i, kind: 'str' });
+      continue;
+    }
+    if (c === '<' && src[i + 1] !== '<') {
+      const start = i;
+      while (i < n && src[i] !== '>') i++;
+      i++;
+      lastOperands.push({ start, end: i, kind: 'hex' });
+      continue;
+    }
+    if (c === '<' && src[i + 1] === '<') { i += 2; continue; }
+    if (c === '>' && src[i + 1] === '>') { i += 2; continue; }
+    if (c === '[') {
+      const start = i; i++;
+      // scan array, respecting nested strings
+      while (i < n && src[i] !== ']') {
+        if (src[i] === '(') {
+          let depth = 0;
+          while (i < n) {
+            const ch = src[i];
+            if (ch === '\\') { i += 2; continue; }
+            if (ch === '(') depth++;
+            else if (ch === ')') { depth--; if (!depth) { i++; break; } }
+            i++;
+          }
+        } else if (src[i] === '<') {
+          while (i < n && src[i] !== '>') i++;
+          i++;
+        } else i++;
+      }
+      i++;
+      lastOperands.push({ start, end: i, kind: 'arr' });
+      continue;
+    }
+    if (c === '/' ) { i++; while (i < n && !isDelim(src[i])) i++; continue; }
+    if (' \t\r\n\f\0'.includes(c)) { i++; continue; }
+    // number or operator token
+    const tStart = i;
+    while (i < n && !isDelim(src[i]) && !' \t\r\n\f\0'.includes(src[i])) i++;
+    const tok = src.slice(tStart, i);
+    if (tok === 'Tj' || tok === 'TJ' || tok === "'" || tok === '"') {
+      const opnd = lastOperands[lastOperands.length - 1];
+      if (opnd) shows.push({ op: tok, opEnd: i, operandStart: opnd.start, operandEnd: opnd.end, kind: opnd.kind });
+    }
+    if (!/^[+-]?[\d.]+$/.test(tok)) lastOperands = []; // operators reset operand accumulation
+    continue;
+  }
+  return shows;
+}
+
+function escapePdfString(s) {
+  return s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+}
+
+function tryContentStreamEdit(doc, pageIndex, meta, newText) {
   try {
     const { PDFName, PDFArray, PDFRef, decodePDFRawStream } = PDFLib;
-    if (!decodePDFRawStream) return false;
+    if (!decodePDFRawStream || meta.showOpIndex < 0 || meta.compositeFont) return false;
+    for (const ch of newText) if (ch.charCodeAt(0) > 255) return false;
+
     const page = doc.getPages()[pageIndex];
     const ctx = doc.context;
     const contents = page.node.get(PDFName.of('Contents'));
@@ -863,42 +957,62 @@ function tryContentStreamEdit(doc, pageIndex, oldText, newText) {
     const refs = [];
     const resolved = contents instanceof PDFRef ? ctx.lookup(contents) : contents;
     if (resolved instanceof PDFArray) {
-      for (let i = 0; i < resolved.size(); i++) refs.push(resolved.get(i));
+      for (let idx = 0; idx < resolved.size(); idx++) refs.push(resolved.get(idx));
     } else if (contents instanceof PDFRef) {
       refs.push(contents);
     } else return false;
 
-    for (const ch of newText) if (ch.charCodeAt(0) > 255) return false;
-    const esc = s => s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
-    const target = '(' + esc(oldText) + ')';
-    const replacement = '(' + esc(newText) + ')';
-    const toLatin1 = b => { let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return s; };
-
-    // Find the string in the decoded streams. Only proceed when it occurs
-    // exactly once — otherwise we can't know which instance the user clicked.
-    let total = 0;
-    const decoded = [];
+    const toLatin1 = b => { let s = ''; for (let k = 0; k < b.length; k++) s += String.fromCharCode(b[k]); return s; };
+    const parts = [];
     for (const ref of refs) {
       const raw = ctx.lookup(ref);
       let data;
       try { data = decodePDFRawStream(raw).decode(); } catch (e) { data = raw.contents; }
       if (!data) return false;
-      const text = toLatin1(data);
-      let idx = -1, cnt = 0;
-      while ((idx = text.indexOf(target, idx + 1)) !== -1) cnt++;
-      total += cnt;
-      decoded.push({ ref, text, cnt });
+      parts.push({ ref, text: toLatin1(data) });
     }
-    if (total !== 1) return false;
 
-    for (const d of decoded) {
-      if (!d.cnt) continue;
-      const replaced = d.text.replace(target, replacement);
-      const bytes = new Uint8Array(replaced.length);
-      for (let i = 0; i < replaced.length; i++) bytes[i] = replaced.charCodeAt(i) & 0xff;
-      ctx.assign(d.ref, ctx.flateStream(replaced));
+    // Content streams of one page form a single logical stream; find the Nth
+    // text-showing op across all parts.
+    let ordinal = -1;
+    for (const part of parts) {
+      const shows = lexContentStream(part.text);
+      for (const s of shows) {
+        ordinal++;
+        if (ordinal !== meta.showOpIndex) continue;
+        // sanity check: literal operand should decode to the clicked text
+        if (s.kind === 'str') {
+          const lit = part.text.slice(s.operandStart + 1, s.operandEnd - 1)
+            .replace(/\\([nrtbf()\\])/g, (m, g) =>
+              ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '(': '(', ')': ')', '\\': '\\' })[g])
+            .replace(/\\(\d{1,3})/g, (m, oct) => String.fromCharCode(parseInt(oct, 8)));
+          if (lit !== meta.originalText) return false;
+        } else if (s.kind === 'arr') {
+          // TJ array: concatenate its literal strings and compare
+          const arr = part.text.slice(s.operandStart, s.operandEnd);
+          const strs = [];
+          const re = /\((?:[^()\\]|\\.)*\)/g;
+          let mm;
+          while ((mm = re.exec(arr)) !== null) {
+            strs.push(mm[0].slice(1, -1)
+              .replace(/\\([nrtbf()\\])/g, (m, g) =>
+                ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '(': '(', ')': ')', '\\': '\\' })[g])
+              .replace(/\\(\d{1,3})/g, (m, oct) => String.fromCharCode(parseInt(oct, 8))));
+          }
+          if (strs.join('') !== meta.originalText) return false;
+        } else {
+          return false; // hex string — encoding unknown, use fallback
+        }
+        // Replace the whole operand. TJ requires an array operand; Tj/'/" take
+        // a bare string. Kerning offsets are dropped for the new text.
+        const lit = '(' + escapePdfString(newText) + ')';
+        const replacement = s.op === 'TJ' ? '[' + lit + ']' : lit;
+        const newStream = part.text.slice(0, s.operandStart) + replacement + part.text.slice(s.operandEnd);
+        ctx.assign(part.ref, ctx.flateStream(newStream));
+        return true;
+      }
     }
-    return true;
+    return false;
   } catch (e) {
     console.warn('In-place content edit failed, falling back to overlay:', e);
     return false;
@@ -919,7 +1033,7 @@ async function commitTextEdit(pageIndex, meta, newText) {
   // result, keeps original font & background). Only when the replacement's
   // characters are known to exist in the original font's glyphs.
   const charsetOk = !newText || Array.from(newText).every(c => meta.fontCharset.includes(c));
-  if (charsetOk && tryContentStreamEdit(doc, pageIndex, meta.originalText, newText)) {
+  if (charsetOk && tryContentStreamEdit(doc, pageIndex, meta, newText)) {
     workDoc = await doc.save();
     editHistory.push({ pageIndex, oldText: meta.originalText, newText, snapshot });
     updateEditList();
