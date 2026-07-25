@@ -713,8 +713,9 @@ function matchStandardFont(realName, family) {
   const ital = /italic|oblique/.test(n);
   let set = ['Helvetica', 'HelveticaOblique', 'HelveticaBold', 'HelveticaBoldOblique'];
   if (/courier|mono|consol|menlo/.test(n)) set = ['Courier', 'CourierOblique', 'CourierBold', 'CourierBoldOblique'];
-  else if (/times|serif|georgia|roman|book|garamond|palatino|cambria/.test(n)) set = ['TimesRoman', 'TimesItalic', 'TimesBold', 'TimesBoldItalic'];
-  return StandardFonts[bold ? (ital ? set[3] : set[2]) : (ital ? set[1] : set[0])];
+  else if (/times|serif|georgia|roman|book|garamond|palatino|cambria/.test(n)) set = ['TimesRoman', 'TimesRomanItalic', 'TimesRomanBold', 'TimesRomanBoldItalic'];
+  const picked = StandardFonts[bold ? (ital ? set[3] : set[2]) : (ital ? set[1] : set[0])];
+  return picked || StandardFonts.Helvetica; // never return undefined
 }
 
 // Average the pixels just outside the text box on the rendered page — this is
