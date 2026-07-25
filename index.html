@@ -595,6 +595,14 @@ async function renderPdfForEditing() {
       const rawItems = textContent.items;
       const styleArr = await extractTextStyles(page, rawItems.length);
 
+      // All characters each font is known to have glyphs for on this page —
+      // used to decide when an in-place content-stream edit is safe.
+      const charsByFont = {};
+      rawItems.forEach(it => {
+        if (!it.str) return;
+        charsByFont[it.fontName] = (charsByFont[it.fontName] || '') + it.str;
+      });
+
       // De-duplicate (pdf.js sometimes returns the same text twice),
       // keeping the raw index so colors/fonts stay aligned.
       const seen = new Set();
@@ -629,6 +637,7 @@ async function renderPdfForEditing() {
           color: st.color || [0, 0, 0],
           realFontName: getRealFontName(page, item.fontName),
           fontFamily: (textContent.styles[item.fontName] || {}).fontFamily || '',
+          fontCharset: charsByFont[item.fontName] || '',
           devX, devY, devW, devH,
         };
 
@@ -840,6 +849,62 @@ function cancelInlineEdit(textItem) {
   }
 }
 
+// Try to swap the text inside the page's raw content stream itself. When this
+// works it is a perfect edit: original font, spacing, color and background all
+// stay untouched — no rectangle is painted at all.
+function tryContentStreamEdit(doc, pageIndex, oldText, newText) {
+  try {
+    const { PDFName, PDFArray, PDFRef, decodePDFRawStream } = PDFLib;
+    if (!decodePDFRawStream) return false;
+    const page = doc.getPages()[pageIndex];
+    const ctx = doc.context;
+    const contents = page.node.get(PDFName.of('Contents'));
+    if (!contents) return false;
+    const refs = [];
+    const resolved = contents instanceof PDFRef ? ctx.lookup(contents) : contents;
+    if (resolved instanceof PDFArray) {
+      for (let i = 0; i < resolved.size(); i++) refs.push(resolved.get(i));
+    } else if (contents instanceof PDFRef) {
+      refs.push(contents);
+    } else return false;
+
+    for (const ch of newText) if (ch.charCodeAt(0) > 255) return false;
+    const esc = s => s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+    const target = '(' + esc(oldText) + ')';
+    const replacement = '(' + esc(newText) + ')';
+    const toLatin1 = b => { let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return s; };
+
+    // Find the string in the decoded streams. Only proceed when it occurs
+    // exactly once — otherwise we can't know which instance the user clicked.
+    let total = 0;
+    const decoded = [];
+    for (const ref of refs) {
+      const raw = ctx.lookup(ref);
+      let data;
+      try { data = decodePDFRawStream(raw).decode(); } catch (e) { data = raw.contents; }
+      if (!data) return false;
+      const text = toLatin1(data);
+      let idx = -1, cnt = 0;
+      while ((idx = text.indexOf(target, idx + 1)) !== -1) cnt++;
+      total += cnt;
+      decoded.push({ ref, text, cnt });
+    }
+    if (total !== 1) return false;
+
+    for (const d of decoded) {
+      if (!d.cnt) continue;
+      const replaced = d.text.replace(target, replacement);
+      const bytes = new Uint8Array(replaced.length);
+      for (let i = 0; i < replaced.length; i++) bytes[i] = replaced.charCodeAt(i) & 0xff;
+      ctx.assign(d.ref, ctx.flateStream(replaced));
+    }
+    return true;
+  } catch (e) {
+    console.warn('In-place content edit failed, falling back to overlay:', e);
+    return false;
+  }
+}
+
 // ===== COMMIT AN EDIT INTO THE PDF =====
 async function commitTextEdit(pageIndex, meta, newText) {
   const pageInfo = currentPdfPages[pageIndex];
@@ -849,6 +914,21 @@ async function commitTextEdit(pageIndex, meta, newText) {
 
   const snapshot = workDoc.slice(); // for undo
   const doc = await PDFDocument.load(workDoc);
+
+  // Preferred path: edit the text in place inside the content stream (perfect
+  // result, keeps original font & background). Only when the replacement's
+  // characters are known to exist in the original font's glyphs.
+  const charsetOk = !newText || Array.from(newText).every(c => meta.fontCharset.includes(c));
+  if (charsetOk && tryContentStreamEdit(doc, pageIndex, meta.originalText, newText)) {
+    workDoc = await doc.save();
+    editHistory.push({ pageIndex, oldText: meta.originalText, newText, snapshot });
+    updateEditList();
+    await refreshThumbs();
+    await renderPdfForEditing();
+    return;
+  }
+
+  // Fallback: paint over the old text and draw replacement with a standard font.
   const page = doc.getPages()[pageIndex];
   const font = await doc.embedFont(matchStandardFont(meta.realFontName, meta.fontFamily));
 
