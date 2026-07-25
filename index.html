@@ -723,32 +723,35 @@ function matchStandardFont(realName, family) {
 function sampleBackground(canvas, bx, by, bw, bh) {
   try {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const m = 3;
-    const pts = [];
-    // sample just above/below the text but stay INSIDE the cell horizontally,
-    // so we don't land on table gridlines / borders
-    for (let i = 1; i <= 3; i++) {
-      const fx = bx + (bw * i) / 4;
-      pts.push([fx, by - m], [fx, by + bh + m]);
+    // Read the whole region around the text in one go and pick the single
+    // MOST COMMON color (mode). Gridlines, borders and the glyphs themselves
+    // are a minority of pixels, so they can't influence the result at all.
+    const pad = 6;
+    const rx = Math.max(0, Math.round(bx - pad));
+    const ry = Math.max(0, Math.round(by - pad));
+    const rw = Math.min(canvas.width - rx, Math.round(bw + pad * 2));
+    const rh = Math.min(canvas.height - ry, Math.round(bh + pad * 2));
+    if (rw <= 0 || rh <= 0) return [1, 1, 1];
+    const data = ctx.getImageData(rx, ry, rw, rh).data;
+    const counts = new Map();
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] === 0) continue;
+      // quantize to 16-level buckets so antialiased shades group together
+      const key = ((data[i] >> 4) << 8) | ((data[i + 1] >> 4) << 4) | (data[i + 2] >> 4);
+      counts.set(key, (counts.get(key) || 0) + 1);
     }
-    pts.push([bx - m, by + bh / 2], [bx + bw + m, by + bh / 2]);
-    const samples = [];
-    for (const [px, py] of pts) {
-      const cx = Math.max(0, Math.min(canvas.width - 1, Math.round(px)));
-      const cy = Math.max(0, Math.min(canvas.height - 1, Math.round(py)));
-      const d = ctx.getImageData(cx, cy, 1, 1).data;
-      if (d[3] === 0) continue;
-      samples.push([d[0], d[1], d[2]]);
+    if (!counts.size) return [1, 1, 1];
+    let bestKey = 0, bestN = -1;
+    for (const [k, n] of counts) if (n > bestN) { bestN = n; bestKey = k; }
+    // average the exact pixels belonging to the winning bucket for a clean value
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] === 0) continue;
+      const key = ((data[i] >> 4) << 8) | ((data[i + 1] >> 4) << 4) | (data[i + 2] >> 4);
+      if (key !== bestKey) continue;
+      r += data[i]; g += data[i + 1]; b += data[i + 2]; n++;
     }
-    if (!samples.length) return [1, 1, 1];
-    // median per channel instead of mean — a few dark gridline/border pixels
-    // no longer drag white backgrounds down to grey
-    const med = ch => {
-      const v = samples.map(s => s[ch]).sort((a, b) => a - b);
-      const mid = v.length >> 1;
-      return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
-    };
-    return [med(0) / 255, med(1) / 255, med(2) / 255];
+    return [r / n / 255, g / n / 255, b / n / 255];
   } catch (e) { return [1, 1, 1]; }
 }
 
